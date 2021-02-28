@@ -3,10 +3,7 @@ import time
 import math
 from ekf import *
 import ekf.math
-
-class Serializable(object):
-  def to_dict(self):
-    pass
+import numpy as np
 
 
 class VehicleHandler:
@@ -34,17 +31,15 @@ class VehicleCallbacks(VehicleHandler):
 
 
 
-class Vehicle(Serializable):
+class Vehicle(object):
   __slots__ = ['props', 'state', 'ekf', 'handler']
-
-  class Properties(Serializable):
+  class Properties(object):
     __slots__ = ['wheel_base', 'ekf_dt', 'brake_coeff']
     def __init__(self, wheel_base=1.0, ekf_dt=0.1, brake_coeff=0.8):
       self.wheel_base = float(wheel_base)
       self.ekf_dt = float(ekf_dt)
       self.brake_coeff = float(brake_coeff)
-
-  class State(Serializable):
+  class State(object):
     __slots__ = ['t', 'x', 'y', 'hdg', 'vel', 'accel', 'throttle', 'brake', 'steering_angle', 'steering_rate', 'yaw_rate']
     def __init__(self, t=0.0, x=0.0, y=0.0, hdg=0.0, vel=0.0, accel=0.0, throttle=0.0, brake=0.0, steering_angle=0.0, steering_rate=0.0, yaw_rate=0.0):
       self.t = float(t)
@@ -69,8 +64,7 @@ class Vehicle(Serializable):
     u = CoordVectorSymbol('u', uf)
     z = CoordVectorSymbol('z', zf)
     c = CoordVectorSymbol('c', cf)
-    f = CoordVector(xf,
-    [
+    f = CoordVectorFunction(xf, (x, u, c), [
       x['t'] + c['dt'],
       x['x'] + ekf.math.cos(x['theta'])*x['vel']*c['dt'] + 0.5*ekf.math.cos(x['theta'])*x['accel']*c['dt']*c['dt'],
       x['y'] + ekf.math.sin(x['theta'])*x['vel']*c['dt'] + 0.5*ekf.math.sin(x['theta'])*x['accel']*c['dt']*c['dt'],
@@ -79,8 +73,7 @@ class Vehicle(Serializable):
       u['throttle'] - (1.0 - c['brake_coeff']*c['dt'])*u['brake']*x['vel'],
       x['delta'] + c['dt']*u['steering_rate']
     ])
-    h = CoordVector(zf,
-    [
+    h = CoordVectorFunction(zf, (x, c), [
       ekf.math.sqrt(x['x']*x['x'] + x['y']*x['y']),
       ekf.math.atan2(-x['y'], -x['x']) - x['theta'],
       x['vel'],
@@ -88,28 +81,37 @@ class Vehicle(Serializable):
     ])
 
     ekf_desc = EKFDesc(x, u, z, f, h, c)
-
-    self.ekf = ekf.EKF(ekf_desc)        
-    self.ekf.x_k = self.ekf.desc.make_x([self.state.t, self.state.x, self.state.y, self.state.hdg, self.state.vel, self.state.accel, self.state.steering_angle])
-    self.ekf.c_k = self.ekf.desc.make_c([self.props.ekf_dt, self.props.wheel_base, self.props.brake_coeff])
+    self.ekf = ekf.EKF(ekf_desc)
+    self.ekf.x_k = self.ekf.desc.xf.make([self.state.t, self.state.x, self.state.y, self.state.hdg, self.state.vel, self.state.accel, self.state.steering_angle])
+    self.ekf.c_k = self.ekf.desc.cf.make([self.props.ekf_dt, self.props.wheel_base, self.props.brake_coeff])
 
   def ekf_update(self):
     control = [self.state.throttle, self.state.brake, self.state.steering_rate]
+    process_errcov = self.ekf.desc.Qf.make_diag([0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001])
 
-    measurement = [
+    meas_errcov = self.ekf.desc.Rf.make_diag([0.001, 0.001, 0.001, 0.001])
+    meas_sample = self.meas_get(meas_errcov)
+
+    u_k = self.ekf.desc.uf.make(control)
+    Q_k = self.ekf.desc.Qf.make(process_errcov)
+    self.ekf.predict(u_k, Q_k)
+
+    z_k = self.ekf.desc.zf.make(meas_sample)
+    R_k = self.ekf.desc.Rf.make(meas_errcov)
+    self.ekf.update(z_k, R_k)
+
+  def meas_get(self, error_covar=None):
+    exact = np.float64([
         math.sqrt(self.state.x*self.state.x + self.state.y*self.state.y),
         math.atan2(-self.state.y,-self.state.x) - self.state.hdg,
         self.state.vel,
         self.state.vel * math.tan(self.state.steering_angle) / self.props.wheel_base,
-    ]
-
-    u_k = self.ekf.desc.make_u(control)
-    Q_k = self.ekf.desc.make_diag_Q([0.0, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001])
-    self.ekf.predict(u_k, Q_k)
-
-    z_k = self.ekf.desc.make_z(measurement)
-    R_k = self.ekf.desc.make_diag_R([0.01, 0.01, 0.01, 0.01])
-    self.ekf.update(z_k, R_k)
+    ])
+    if error_covar is not None:
+      error = np.random.multivariate_normal(np.zeros(4), error_covar, 1)[0]
+      return exact + error
+    else:
+      return exact
 
   def step(self, delta_t):
     curr_state = self.state
@@ -126,14 +128,10 @@ class Vehicle(Serializable):
     next_state.x = curr_state.x + delta_t * curr_state.vel * math.cos(curr_state.hdg)
     next_state.y = curr_state.y + delta_t * curr_state.vel * math.sin(curr_state.hdg)
     next_state.t = curr_state.t + delta_t
+    #next_state.inv_radius = math.tan(self.state.steering_angle) / self.props.wheel_base
 
     self.state = next_state
     self.handler.on_step(self)
-
-    #print("Vehicle.step: self.state=", self.state)
-    #inv_radius = math.tan(self.state.steering_angle) / self.props.wheel_base
-    #print("vehicle.step: inv_radius=", inv_radius)
-    #print("vehicle.step: radius=", 1.0 / inv_radius if math.fabs(inv_radius) > 0.001 else 0.0)
 
     while self.state.t > (self.ekf.x_k[self.ekf.desc.xf.index('t')] + self.ekf.c_k[self.ekf.desc.cf.index('dt')]):
       self.ekf_update()
@@ -145,10 +143,6 @@ class Vehicle(Serializable):
     self.handler = handler
     self.ekf_init()
     self.handler.on_init(self)
-
-
-
-
 
 def test_vehicle():
   delta_t = 0.01
@@ -167,8 +161,11 @@ def test_vehicle():
     print("on_step: vehicle.state: t=%f, x=%f, y=%f, hdg=%f, vel=%f, accel=%f, throttle=%f, brake=%f, steering_angle=%f, steering_rate=%f, yaw_rate=%f, inv_radius=%f" % (vs.t, vs.x, vs.y, vs.hdg, vs.vel, vs.accel, vs.throttle, vs.brake, vs.steering_angle, vs.steering_rate, vs.yaw_rate, inv_radius))
 
   def on_ekf_update(vehicle):
+    error = np.float64([vehicle.state.x, vehicle.state.y]) - np.float64([vehicle.ekf.x_k[1,0], vehicle.ekf.x_k[2,0]])
+    error_dist = np.sqrt(error.dot(error))
     print("on_ekf_update: vehicle.ekf.x_k:", repr(vehicle.ekf.x_k.transpose()))
     #print("on_ekf_update: vehicle.ekf.P_k:", repr(vehicle.ekf.P_k))
+    print("on_ekf_update: error_dist=%f" % (error_dist,))
 
   callbacks = VehicleCallbacks()
   callbacks.on_init = on_init
